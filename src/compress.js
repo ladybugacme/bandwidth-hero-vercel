@@ -1,97 +1,89 @@
 const sharp = require('sharp');
 const redirect = require('./redirect');
 const isAnimated = require('is-animated');
-const { execFile } = require('node:child_process');
-const fs = require('node:fs/promises');
-const os = require('node:os');
 const { URL } = require('url');
+
+const sharpenParams = {
+  sigma: 1.0, // Controls the radius of the sharpening
+  flat: 1.0,  // Adjusts sharpening in flat areas
+  jagged: 0.5 // Adjusts sharpening in areas with jagged edges
+};
+
 async function compress(req, res, input) {
+  try {
     const format = req.params.webp ? 'webp' : 'jpeg';
-    const originType = req.params.originType;
-    sharp(input)
-        .metadata(async (err, metadata) => {
-            if (err) {
-                console.error("Error fetching metadata:", err);
-                return redirect(req, res);
-            }
-            let pixelCount = metadata.width * metadata.height;
-            let compressionQuality = adjustCompressionQuality(pixelCount, metadata.size, req.params.quality);
-            if (format === 'webp' && isAnimated(input)) {
-                sharp(input, { animated: true })
-                    .grayscale(req.params.grayscale)
-                    .toFormat(format, {
-                        quality: compressionQuality, //output image quality.
-                        loop: 0,
-			alphaQuality: 80, //quality of alpha layer, integer 0-100.
-                        smartSubsample: true, //use high quality chroma subsampling.
-                        progressive: true,
-                        optimizeScans: true
-                    })
-                    .toBuffer((err, output, info) => {
-                        if (err || !info || res.headersSent) {
-                            console.error("Error in image compression:", err);
-                            return redirect(req, res);
-                        }
-                        sendImage(res, output, format, req.params.url, req.params.originSize);
-                    });
-            } else {
-                sharp(input)
-                    .grayscale(req.params.grayscale)
-                    .toFormat(format, {
-                        quality: compressionQuality, //output image quality.
-                        alphaQuality: 80, //quality of alpha layer, integer 0-100.
-                        smartSubsample: true, //use high quality chroma subsampling.
-                        progressive: true,
-                        optimizeScans: true
-                    })
-                    .toBuffer((err, output, info) => {
-                        if (err || !info || res.headersSent) {
-                            console.error("Error in image compression:", err);
-                            return redirect(req, res);
-                        }
-                        sendImage(res, output, format, req.params.url, req.params.originSize);
-                    });
-            }
-        });
+    const { quality, grayscale, originSize, url } = req.params;
+
+    // Get image metadata
+    const metadata = await sharp(input).metadata();
+
+    const pixelCount = metadata.width * metadata.height;
+    const compressionQuality = adjustCompressionQuality(pixelCount, metadata.size, quality);
+
+    // Handle animated WebP differently
+    const isWebPAnimated = format === 'webp' && isAnimated(input);
+
+    const sharpInstance = sharp(input, { animated: isWebPAnimated })
+      .grayscale(grayscale)
+      .sharpen(sharpenParams.sigma, sharpenParams.flat, sharpenParams.jagged)
+      .toFormat(format, {
+        quality: compressionQuality,
+        alphaQuality: 80,
+        smartSubsample: true,
+        progressive: true,
+        optimizeScans: true,
+        loop: isWebPAnimated ? 0 : undefined
+      });
+
+    const output = await sharpInstance.toBuffer();
+    
+    // If response headers are already sent, log and skip sending.
+    if (res.headersSent) {
+      console.error('Headers already sent, unable to compress the image.');
+      return;
+    }
+
+    // Send the compressed image as a response
+    sendImage(res, output, format, url, originSize);
+
+  } catch (err) {
+    console.error('Error during image compression:', err);
+    return redirect(req, res);
+  }
 }
 
-//t
-function calculateQualityFactor(pixelCount, size) {
-  // These thresholds can be adjusted or even made configurable.
+// Function to adjust compression quality based on image properties
+function adjustCompressionQuality(pixelCount, size, quality) {
   const thresholds = [
     { pixels: 3000000, size: 1536000, factor: 0.1 },
     { pixels: 2000000, size: 1024000, factor: 0.25 },
     { pixels: 1000000, size: 512000, factor: 0.5 },
-    { pixels: 500000, size: 256000, factor: 0.75 },
+    { pixels: 500000, size: 256000, factor: 0.75 }
   ];
 
   for (let threshold of thresholds) {
     if (pixelCount > threshold.pixels && size > threshold.size) {
-      return threshold.factor;
+      return Math.ceil(quality * threshold.factor);
     }
   }
-  return 1; // default factor
+
+  return quality; // Return the default quality if no thresholds are met
 }
 
-function adjustCompressionQuality(pixelCount, size, quality) {
-  const factor = calculateQualityFactor(pixelCount, size);
-  return Math.ceil(quality * factor);
-}
-
-
+// Function to send the compressed image response
 function sendImage(res, data, imgFormat, url, originSize) {
-    res.setHeader('content-type', `image/${imgFormat}`);
-    res.setHeader('content-length', data.length);
-    let filename = encodeURIComponent(new URL(url).pathname.split('/').pop() || "image") + '.' + imgFormat;
-    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    // Ensure x-original-size is a positive integer
-    let safeOriginSize = Math.max(originSize, 0);
-    res.setHeader('x-original-size', safeOriginSize);
-    // Calculate bytes saved and ensure it's not negative
-    let bytesSaved = Math.max(safeOriginSize - data.length, 0);
-    res.setHeader('x-bytes-saved', bytesSaved);
-    res.status(200);
-    res.end(data);
+  const filename = encodeURIComponent(new URL(url).pathname.split('/').pop() || 'image') + `.${imgFormat}`;
+  
+  res.setHeader('Content-Type', `image/${imgFormat}`);
+  res.setHeader('Content-Length', data.length);
+  res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  const safeOriginSize = Math.max(originSize, 0);
+  res.setHeader('x-original-size', safeOriginSize);
+  res.setHeader('x-bytes-saved', Math.max(safeOriginSize - data.length, 0));
+
+  res.status(200).end(data);
 }
+
 module.exports = compress;
